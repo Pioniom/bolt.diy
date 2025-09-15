@@ -1,215 +1,311 @@
-import { convertToCoreMessages, streamText as _streamText } from 'ai';
-import { MAX_TOKENS } from './constants';
+import { convertToCoreMessages, streamText as _streamText, type Message } from 'ai';
+import { MAX_TOKENS, PROVIDER_COMPLETION_LIMITS, isReasoningModel, type FileMap } from './constants';
 import { getSystemPrompt } from '~/lib/common/prompts/prompts';
-import {
-  DEFAULT_MODEL,
-  DEFAULT_PROVIDER,
-  getModelList,
-  MODEL_REGEX,
-  MODIFICATIONS_TAG_NAME,
-  PROVIDER_LIST,
-  PROVIDER_REGEX,
-  WORK_DIR,
-} from '~/utils/constants';
-import ignore from 'ignore';
+import { DEFAULT_MODEL, DEFAULT_PROVIDER, MODIFICATIONS_TAG_NAME, PROVIDER_LIST, WORK_DIR } from '~/utils/constants';
 import type { IProviderSetting } from '~/types/model';
 import { PromptLibrary } from '~/lib/common/prompt-library';
 import { allowedHTMLElements } from '~/utils/markdown';
-
-interface ToolResult<Name extends string, Args, Result> {
-  toolCallId: string;
-  toolName: Name;
-  args: Args;
-  result: Result;
-}
-
-interface Message {
-  role: 'user' | 'assistant';
-  content: string;
-  toolInvocations?: ToolResult<string, unknown, unknown>[];
-  model?: string;
-}
+import { LLMManager } from '~/lib/modules/llm/manager';
+import { createScopedLogger } from '~/utils/logger';
+import { createFilesContext, extractPropertiesFromMessage } from './utils';
+import { discussPrompt } from '~/lib/common/prompts/discuss-prompt';
+import type { DesignScheme } from '~/types/design-scheme';
 
 export type Messages = Message[];
 
-export type StreamingOptions = Omit<Parameters<typeof _streamText>[0], 'model'>;
-
-export interface File {
-  type: 'file';
-  content: string;
-  isBinary: boolean;
+export interface StreamingOptions extends Omit<Parameters<typeof _streamText>[0], 'model'> {
+  supabaseConnection?: {
+    isConnected: boolean;
+    hasSelectedProject: boolean;
+    credentials?: {
+      anonKey?: string;
+      supabaseUrl?: string;
+    };
+  };
 }
 
-export interface Folder {
-  type: 'folder';
+const logger = createScopedLogger('stream-text');
+
+function getCompletionTokenLimit(modelDetails: any): number {
+  // 1. If model specifies completion tokens, use that
+  if (modelDetails.maxCompletionTokens && modelDetails.maxCompletionTokens > 0) {
+    return modelDetails.maxCompletionTokens;
+  }
+
+  // 2. Use provider-specific default
+  const providerDefault = PROVIDER_COMPLETION_LIMITS[modelDetails.provider];
+
+  if (providerDefault) {
+    return providerDefault;
+  }
+
+  // 3. Final fallback to MAX_TOKENS, but cap at reasonable limit for safety
+  return Math.min(MAX_TOKENS, 16384);
 }
 
-type Dirent = File | Folder;
+function sanitizeText(text: string): string {
+  let sanitized = text.replace(/<div class=\\"__boltThought__\\">.*?<\/div>/s, '');
+  sanitized = sanitized.replace(/<think>.*?<\/think>/s, '');
+  sanitized = sanitized.replace(/<boltAction type="file" filePath="package-lock\.json">[\s\S]*?<\/boltAction>/g, '');
 
-export type FileMap = Record<string, Dirent | undefined>;
-
-export function simplifyBoltActions(input: string): string {
-  // Using regex to match boltAction tags that have type="file"
-  const regex = /(<boltAction[^>]*type="file"[^>]*>)([\s\S]*?)(<\/boltAction>)/g;
-
-  // Replace each matching occurrence
-  return input.replace(regex, (_0, openingTag, _2, closingTag) => {
-    return `${openingTag}\n          ...\n        ${closingTag}`;
-  });
-}
-
-// Common patterns to ignore, similar to .gitignore
-const IGNORE_PATTERNS = [
-  'node_modules/**',
-  '.git/**',
-  'dist/**',
-  'build/**',
-  '.next/**',
-  'coverage/**',
-  '.cache/**',
-  '.vscode/**',
-  '.idea/**',
-  '**/*.log',
-  '**/.DS_Store',
-  '**/npm-debug.log*',
-  '**/yarn-debug.log*',
-  '**/yarn-error.log*',
-  '**/*lock.json',
-  '**/*lock.yml',
-];
-const ig = ignore().add(IGNORE_PATTERNS);
-
-function createFilesContext(files: FileMap) {
-  let filePaths = Object.keys(files);
-  filePaths = filePaths.filter((x) => {
-    const relPath = x.replace('/home/project/', '');
-    return !ig.ignores(relPath);
-  });
-
-  const fileContexts = filePaths
-    .filter((x) => files[x] && files[x].type == 'file')
-    .map((path) => {
-      const dirent = files[path];
-
-      if (!dirent || dirent.type == 'folder') {
-        return '';
-      }
-
-      const codeWithLinesNumbers = dirent.content
-        .split('\n')
-        .map((v, i) => `${i + 1}|${v}`)
-        .join('\n');
-
-      return `<file path="${path}">\n${codeWithLinesNumbers}\n</file>`;
-    });
-
-  return `Below are the code files present in the webcontainer:\ncode format:\n<line number>|<line content>\n <codebase>${fileContexts.join('\n\n')}\n\n</codebase>`;
-}
-
-function extractPropertiesFromMessage(message: Message): { model: string; provider: string; content: string } {
-  const textContent = Array.isArray(message.content)
-    ? message.content.find((item) => item.type === 'text')?.text || ''
-    : message.content;
-
-  const modelMatch = textContent.match(MODEL_REGEX);
-  const providerMatch = textContent.match(PROVIDER_REGEX);
-
-  /*
-   * Extract model
-   * const modelMatch = message.content.match(MODEL_REGEX);
-   */
-  const model = modelMatch ? modelMatch[1] : DEFAULT_MODEL;
-
-  /*
-   * Extract provider
-   * const providerMatch = message.content.match(PROVIDER_REGEX);
-   */
-  const provider = providerMatch ? providerMatch[1] : DEFAULT_PROVIDER.name;
-
-  const cleanedContent = Array.isArray(message.content)
-    ? message.content.map((item) => {
-        if (item.type === 'text') {
-          return {
-            type: 'text',
-            text: item.text?.replace(MODEL_REGEX, '').replace(PROVIDER_REGEX, ''),
-          };
-        }
-
-        return item; // Preserve image_url and other types as is
-      })
-    : textContent.replace(MODEL_REGEX, '').replace(PROVIDER_REGEX, '');
-
-  return { model, provider, content: cleanedContent };
+  return sanitized.trim();
 }
 
 export async function streamText(props: {
-  messages: Messages;
-  env: Env;
+  messages: Omit<Message, 'id'>[];
+  env?: Env;
   options?: StreamingOptions;
   apiKeys?: Record<string, string>;
   files?: FileMap;
   providerSettings?: Record<string, IProviderSetting>;
   promptId?: string;
+  contextOptimization?: boolean;
+  contextFiles?: FileMap;
+  summary?: string;
+  messageSliceId?: number;
+  chatMode?: 'discuss' | 'build';
+  designScheme?: DesignScheme;
 }) {
-  const { messages, env: serverEnv, options, apiKeys, files, providerSettings, promptId } = props;
-
-  // console.log({serverEnv});
-
+  const {
+    messages,
+    env: serverEnv,
+    options,
+    apiKeys,
+    files,
+    providerSettings,
+    promptId,
+    contextOptimization,
+    contextFiles,
+    summary,
+    chatMode,
+    designScheme,
+  } = props;
   let currentModel = DEFAULT_MODEL;
   let currentProvider = DEFAULT_PROVIDER.name;
-  const MODEL_LIST = await getModelList({ apiKeys, providerSettings, serverEnv: serverEnv as any });
-  const processedMessages = messages.map((message) => {
+  let processedMessages = messages.map((message) => {
+    const newMessage = { ...message };
+
     if (message.role === 'user') {
       const { model, provider, content } = extractPropertiesFromMessage(message);
-
-      if (MODEL_LIST.find((m) => m.name === model)) {
-        currentModel = model;
-      }
-
+      currentModel = model;
       currentProvider = provider;
-
-      return { ...message, content };
+      newMessage.content = sanitizeText(content);
     } else if (message.role == 'assistant') {
-      const content = message.content;
-
-      // content = simplifyBoltActions(content);
-
-      return { ...message, content };
+      newMessage.content = sanitizeText(message.content);
     }
 
-    return message;
+    // Sanitize all text parts in parts array, if present
+    if (Array.isArray(message.parts)) {
+      newMessage.parts = message.parts.map((part) =>
+        part.type === 'text' ? { ...part, text: sanitizeText(part.text) } : part,
+      );
+    }
+
+    return newMessage;
   });
 
-  const modelDetails = MODEL_LIST.find((m) => m.name === currentModel);
-
-  const dynamicMaxTokens = modelDetails && modelDetails.maxTokenAllowed ? modelDetails.maxTokenAllowed : MAX_TOKENS;
-
   const provider = PROVIDER_LIST.find((p) => p.name === currentProvider) || DEFAULT_PROVIDER;
+  const staticModels = LLMManager.getInstance().getStaticModelListFromProvider(provider);
+  let modelDetails = staticModels.find((m) => m.name === currentModel);
+
+  if (!modelDetails) {
+    const modelsList = [
+      ...(provider.staticModels || []),
+      ...(await LLMManager.getInstance().getModelListFromProvider(provider, {
+        apiKeys,
+        providerSettings,
+        serverEnv: serverEnv as any,
+      })),
+    ];
+
+    if (!modelsList.length) {
+      throw new Error(`No models found for provider ${provider.name}`);
+    }
+
+    modelDetails = modelsList.find((m) => m.name === currentModel);
+
+    if (!modelDetails) {
+      // Check if it's a Google provider and the model name looks like it might be incorrect
+      if (provider.name === 'Google' && currentModel.includes('2.5')) {
+        throw new Error(
+          `Model "${currentModel}" not found. Gemini 2.5 Pro doesn't exist. Available Gemini models include: gemini-1.5-pro, gemini-2.0-flash, gemini-1.5-flash. Please select a valid model.`,
+        );
+      }
+
+      // Fallback to first model with warning
+      logger.warn(
+        `MODEL [${currentModel}] not found in provider [${provider.name}]. Falling back to first model. ${modelsList[0].name}`,
+      );
+      modelDetails = modelsList[0];
+    }
+  }
+
+  const dynamicMaxTokens = modelDetails ? getCompletionTokenLimit(modelDetails) : Math.min(MAX_TOKENS, 16384);
+
+  // Use model-specific limits directly - no artificial cap needed
+  const safeMaxTokens = dynamicMaxTokens;
+
+  logger.info(
+    `Token limits for model ${modelDetails.name}: maxTokens=${safeMaxTokens}, maxTokenAllowed=${modelDetails.maxTokenAllowed}, maxCompletionTokens=${modelDetails.maxCompletionTokens}`,
+  );
 
   let systemPrompt =
     PromptLibrary.getPropmtFromLibrary(promptId || 'default', {
       cwd: WORK_DIR,
       allowedHtmlElements: allowedHTMLElements,
       modificationTagName: MODIFICATIONS_TAG_NAME,
+      designScheme,
+      supabase: {
+        isConnected: options?.supabaseConnection?.isConnected || false,
+        hasSelectedProject: options?.supabaseConnection?.hasSelectedProject || false,
+        credentials: options?.supabaseConnection?.credentials || undefined,
+      },
     }) ?? getSystemPrompt();
-  let codeContext = '';
 
-  if (files) {
-    codeContext = createFilesContext(files);
-    codeContext = '';
-    systemPrompt = `${systemPrompt}\n\n ${codeContext}`;
+  if (chatMode === 'build' && contextFiles && contextOptimization) {
+    const codeContext = createFilesContext(contextFiles, true);
+
+    systemPrompt = `${systemPrompt}
+
+    Below is the artifact containing the context loaded into context buffer for you to have knowledge of and might need changes to fullfill current user request.
+    CONTEXT BUFFER:
+    ---
+    ${codeContext}
+    ---
+    `;
+
+    if (summary) {
+      systemPrompt = `${systemPrompt}
+      below is the chat history till now
+      CHAT SUMMARY:
+      ---
+      ${props.summary}
+      ---
+      `;
+
+      if (props.messageSliceId) {
+        processedMessages = processedMessages.slice(props.messageSliceId);
+      } else {
+        const lastMessage = processedMessages.pop();
+
+        if (lastMessage) {
+          processedMessages = [lastMessage];
+        }
+      }
+    }
   }
 
-  return _streamText({
+  const effectiveLockedFilePaths = new Set<string>();
+
+  if (files) {
+    for (const [filePath, fileDetails] of Object.entries(files)) {
+      if (fileDetails?.isLocked) {
+        effectiveLockedFilePaths.add(filePath);
+      }
+    }
+  }
+
+  if (effectiveLockedFilePaths.size > 0) {
+    const lockedFilesListString = Array.from(effectiveLockedFilePaths)
+      .map((filePath) => `- ${filePath}`)
+      .join('\n');
+    systemPrompt = `${systemPrompt}
+
+    IMPORTANT: The following files are locked and MUST NOT be modified in any way. Do not suggest or make any changes to these files. You can proceed with the request but DO NOT make any changes to these files specifically:
+    ${lockedFilesListString}
+    ---
+    `;
+  } else {
+    console.log('No locked files found from any source for prompt.');
+  }
+
+  logger.info(`Sending llm call to ${provider.name} with model ${modelDetails.name}`);
+
+  // Log reasoning model detection and token parameters
+  const isReasoning = isReasoningModel(modelDetails.name);
+  logger.info(
+    `Model "${modelDetails.name}" is reasoning model: ${isReasoning}, using ${isReasoning ? 'maxCompletionTokens' : 'maxTokens'}: ${safeMaxTokens}`,
+  );
+
+  // Validate token limits before API call
+  if (safeMaxTokens > (modelDetails.maxTokenAllowed || 128000)) {
+    logger.warn(
+      `Token limit warning: requesting ${safeMaxTokens} tokens but model supports max ${modelDetails.maxTokenAllowed || 128000}`,
+    );
+  }
+
+  // Use maxCompletionTokens for reasoning models (o1, GPT-5), maxTokens for traditional models
+  const tokenParams = isReasoning ? { maxCompletionTokens: safeMaxTokens } : { maxTokens: safeMaxTokens };
+
+  // Filter out unsupported parameters for reasoning models
+  const filteredOptions =
+    isReasoning && options
+      ? Object.fromEntries(
+          Object.entries(options).filter(
+            ([key]) =>
+              ![
+                'temperature',
+                'topP',
+                'presencePenalty',
+                'frequencyPenalty',
+                'logprobs',
+                'topLogprobs',
+                'logitBias',
+              ].includes(key),
+          ),
+        )
+      : options || {};
+
+  // DEBUG: Log filtered options
+  logger.info(
+    `DEBUG STREAM: Options filtering for model "${modelDetails.name}":`,
+    JSON.stringify(
+      {
+        isReasoning,
+        originalOptions: options || {},
+        filteredOptions,
+        originalOptionsKeys: options ? Object.keys(options) : [],
+        filteredOptionsKeys: Object.keys(filteredOptions),
+        removedParams: options ? Object.keys(options).filter((key) => !(key in filteredOptions)) : [],
+      },
+      null,
+      2,
+    ),
+  );
+
+  const streamParams = {
     model: provider.getModelInstance({
-      model: currentModel,
+      model: modelDetails.name,
       serverEnv,
       apiKeys,
       providerSettings,
     }),
-    system: systemPrompt,
-    maxTokens: dynamicMaxTokens,
+    system: chatMode === 'build' ? systemPrompt : discussPrompt(),
+    ...tokenParams,
     messages: convertToCoreMessages(processedMessages as any),
-    ...options,
-  });
+    ...filteredOptions,
+
+    // Set temperature to 1 for reasoning models (required by OpenAI API)
+    ...(isReasoning ? { temperature: 1 } : {}),
+  };
+
+  // DEBUG: Log final streaming parameters
+  logger.info(
+    `DEBUG STREAM: Final streaming params for model "${modelDetails.name}":`,
+    JSON.stringify(
+      {
+        hasTemperature: 'temperature' in streamParams,
+        hasMaxTokens: 'maxTokens' in streamParams,
+        hasMaxCompletionTokens: 'maxCompletionTokens' in streamParams,
+        paramKeys: Object.keys(streamParams).filter((key) => !['model', 'messages', 'system'].includes(key)),
+        streamParams: Object.fromEntries(
+          Object.entries(streamParams).filter(([key]) => !['model', 'messages', 'system'].includes(key)),
+        ),
+      },
+      null,
+      2,
+    ),
+  );
+
+  return await _streamText(streamParams);
 }

@@ -13,23 +13,25 @@ export default class TogetherProvider extends BaseProvider {
   };
 
   staticModels: ModelInfo[] = [
-    {
-      name: 'Qwen/Qwen2.5-Coder-32B-Instruct',
-      label: 'Qwen/Qwen2.5-Coder-32B-Instruct',
-      provider: 'Together',
-      maxTokenAllowed: 8000,
-    },
+    /*
+     * Essential fallback models - only the most stable/reliable ones
+     * Llama 3.2 90B Vision: 128k context, multimodal capabilities
+     */
     {
       name: 'meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo',
-      label: 'meta-llama/Llama-3.2-90B-Vision-Instruct-Turbo',
+      label: 'Llama 3.2 90B Vision',
       provider: 'Together',
-      maxTokenAllowed: 8000,
+      maxTokenAllowed: 128000,
+      maxCompletionTokens: 8192,
     },
+
+    // Mixtral 8x7B: 32k context, strong performance
     {
       name: 'mistralai/Mixtral-8x7B-Instruct-v0.1',
       label: 'Mixtral 8x7B Instruct',
       provider: 'Together',
-      maxTokenAllowed: 8192,
+      maxTokenAllowed: 32000,
+      maxCompletionTokens: 8192,
     },
   ];
 
@@ -38,41 +40,37 @@ export default class TogetherProvider extends BaseProvider {
     settings?: IProviderSetting,
     serverEnv: Record<string, string> = {},
   ): Promise<ModelInfo[]> {
-    try {
-      const { baseUrl: fetchBaseUrl, apiKey } = this.getProviderBaseUrlAndKey({
-        apiKeys,
-        providerSettings: settings,
-        serverEnv,
-        defaultBaseUrlKey: 'TOGETHER_API_BASE_URL',
-        defaultApiTokenKey: 'TOGETHER_API_KEY',
-      });
-      const baseUrl = fetchBaseUrl || 'https://api.together.xyz/v1';
+    const { baseUrl: fetchBaseUrl, apiKey } = this.getProviderBaseUrlAndKey({
+      apiKeys,
+      providerSettings: settings,
+      serverEnv,
+      defaultBaseUrlKey: 'TOGETHER_API_BASE_URL',
+      defaultApiTokenKey: 'TOGETHER_API_KEY',
+    });
+    const baseUrl = fetchBaseUrl || 'https://api.together.xyz/v1';
 
-      if (!baseUrl || !apiKey) {
-        return [];
-      }
-
-      // console.log({ baseUrl, apiKey });
-
-      const response = await fetch(`${baseUrl}/models`, {
-        headers: {
-          Authorization: `Bearer ${apiKey}`,
-        },
-      });
-
-      const res = (await response.json()) as any;
-      const data = (res || []).filter((model: any) => model.type === 'chat');
-
-      return data.map((m: any) => ({
-        name: m.id,
-        label: `${m.display_name} - in:$${m.pricing.input.toFixed(2)} out:$${m.pricing.output.toFixed(2)} - context ${Math.floor(m.context_length / 1000)}k`,
-        provider: this.name,
-        maxTokenAllowed: 8000,
-      }));
-    } catch (error: any) {
-      console.error('Error getting Together models:', error.message);
+    if (!baseUrl || !apiKey) {
       return [];
     }
+
+    // console.log({ baseUrl, apiKey });
+
+    const response = await fetch(`${baseUrl}/models`, {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    });
+
+    const res = (await response.json()) as any;
+    const data = (res || []).filter((model: any) => model.type === 'chat');
+
+    return data.map((m: any) => ({
+      name: m.id,
+      label: `${m.display_name} - in:$${m.pricing.input.toFixed(2)} out:$${m.pricing.output.toFixed(2)} - context ${Math.floor(m.context_length / 1000)}k`,
+      provider: this.name,
+      maxTokenAllowed: 8000,
+      maxCompletionTokens: 8192,
+    }));
   }
 
   getModelInstance(options: {

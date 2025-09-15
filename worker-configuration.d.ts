@@ -1,5 +1,6 @@
 interface Env {
-  DEFAULT_NUM_CTX:Settings;
+  RUNNING_IN_DOCKER: Settings;
+  DEFAULT_NUM_CTX: Settings;
   ANTHROPIC_API_KEY: string;
   OPENAI_API_KEY: string;
   GROQ_API_KEY: string;
@@ -8,6 +9,7 @@ interface Env {
   OLLAMA_API_BASE_URL: string;
   OPENAI_LIKE_API_KEY: string;
   OPENAI_LIKE_API_BASE_URL: string;
+  OPENAI_LIKE_API_MODELS: string;
   TOGETHER_API_KEY: string;
   TOGETHER_API_BASE_URL: string;
   DEEPSEEK_API_KEY: string;
@@ -16,4 +18,5 @@ interface Env {
   MISTRAL_API_KEY: string;
   XAI_API_KEY: string;
   PERPLEXITY_API_KEY: string;
+  AWS_BEDROCK_CONFIG: string;
 }

@@ -1,4 +1,4 @@
-import type { ActionType, BoltAction, BoltActionData, FileAction, ShellAction } from '~/types/actions';
+import type { ActionType, BoltAction, BoltActionData, FileAction, ShellAction, SupabaseAction } from '~/types/actions';
 import type { BoltArtifactData } from '~/types/artifact';
 import { createScopedLogger } from '~/utils/logger';
 import { unreachable } from '~/utils/unreachable';
@@ -7,11 +7,14 @@ const ARTIFACT_TAG_OPEN = '<boltArtifact';
 const ARTIFACT_TAG_CLOSE = '</boltArtifact>';
 const ARTIFACT_ACTION_TAG_OPEN = '<boltAction';
 const ARTIFACT_ACTION_TAG_CLOSE = '</boltAction>';
+const BOLT_QUICK_ACTIONS_OPEN = '<bolt-quick-actions>';
+const BOLT_QUICK_ACTIONS_CLOSE = '</bolt-quick-actions>';
 
 const logger = createScopedLogger('MessageParser');
 
 export interface ArtifactCallbackData extends BoltArtifactData {
   messageId: string;
+  artifactId?: string;
 }
 
 export interface ActionCallbackData {
@@ -34,6 +37,7 @@ export interface ParserCallbacks {
 
 interface ElementFactoryProps {
   messageId: string;
+  artifactId?: string;
 }
 
 type ElementFactory = (props: ElementFactoryProps) => string;
@@ -47,13 +51,31 @@ interface MessageState {
   position: number;
   insideArtifact: boolean;
   insideAction: boolean;
+  artifactCounter: number;
   currentArtifact?: BoltArtifactData;
   currentAction: BoltActionData;
   actionId: number;
 }
 
+function cleanoutMarkdownSyntax(content: string) {
+  const codeBlockRegex = /^\s*```\w*\n([\s\S]*?)\n\s*```\s*$/;
+  const match = content.match(codeBlockRegex);
+
+  // console.log('matching', !!match, content);
+
+  if (match) {
+    return match[1]; // Remove common leading 4-space indent
+  } else {
+    return content;
+  }
+}
+
+function cleanEscapedTags(content: string) {
+  return content.replace(/&lt;/g, '<').replace(/&gt;/g, '>');
+}
 export class StreamingMessageParser {
   #messages = new Map<string, MessageState>();
+  #artifactCounter = 0;
 
   constructor(private _options: StreamingMessageParserOptions = {}) {}
 
@@ -65,6 +87,7 @@ export class StreamingMessageParser {
         position: 0,
         insideAction: false,
         insideArtifact: false,
+        artifactCounter: 0,
         currentAction: { content: '' },
         actionId: 0,
       };
@@ -77,6 +100,37 @@ export class StreamingMessageParser {
     let earlyBreak = false;
 
     while (i < input.length) {
+      if (input.startsWith(BOLT_QUICK_ACTIONS_OPEN, i)) {
+        const actionsBlockEnd = input.indexOf(BOLT_QUICK_ACTIONS_CLOSE, i);
+
+        if (actionsBlockEnd !== -1) {
+          const actionsBlockContent = input.slice(i + BOLT_QUICK_ACTIONS_OPEN.length, actionsBlockEnd);
+
+          // Find all <bolt-quick-action ...>label</bolt-quick-action> inside
+          const quickActionRegex = /<bolt-quick-action([^>]*)>([\s\S]*?)<\/bolt-quick-action>/g;
+          let match;
+          const buttons = [];
+
+          while ((match = quickActionRegex.exec(actionsBlockContent)) !== null) {
+            const tagAttrs = match[1];
+            const label = match[2];
+            const type = this.#extractAttribute(tagAttrs, 'type');
+            const message = this.#extractAttribute(tagAttrs, 'message');
+            const path = this.#extractAttribute(tagAttrs, 'path');
+            const href = this.#extractAttribute(tagAttrs, 'href');
+            buttons.push(
+              createQuickActionElement(
+                { type: type || '', message: message || '', path: path || '', href: href || '' },
+                label,
+              ),
+            );
+          }
+          output += createQuickActionGroup(buttons);
+          i = actionsBlockEnd + BOLT_QUICK_ACTIONS_CLOSE.length;
+          continue;
+        }
+      }
+
       if (state.insideArtifact) {
         const currentArtifact = state.currentArtifact;
 
@@ -95,6 +149,12 @@ export class StreamingMessageParser {
             let content = currentAction.content.trim();
 
             if ('type' in currentAction && currentAction.type === 'file') {
+              // Remove markdown code block syntax if present and file is not markdown
+              if (!currentAction.filePath.endsWith('.md')) {
+                content = cleanoutMarkdownSyntax(content);
+                content = cleanEscapedTags(content);
+              }
+
               content += '\n';
             }
 
@@ -120,7 +180,12 @@ export class StreamingMessageParser {
             i = closeIndex + ARTIFACT_ACTION_TAG_CLOSE.length;
           } else {
             if ('type' in currentAction && currentAction.type === 'file') {
-              const content = input.slice(i);
+              let content = input.slice(i);
+
+              if (!currentAction.filePath.endsWith('.md')) {
+                content = cleanoutMarkdownSyntax(content);
+                content = cleanEscapedTags(content);
+              }
 
               this._options.callbacks?.onActionStream?.({
                 artifactId: currentArtifact.id,
@@ -160,7 +225,11 @@ export class StreamingMessageParser {
               break;
             }
           } else if (artifactCloseIndex !== -1) {
-            this._options.callbacks?.onArtifactClose?.({ messageId, ...currentArtifact });
+            this._options.callbacks?.onArtifactClose?.({
+              messageId,
+              artifactId: currentArtifact.id,
+              ...currentArtifact,
+            });
 
             state.insideArtifact = false;
             state.currentArtifact = undefined;
@@ -193,7 +262,9 @@ export class StreamingMessageParser {
 
               const artifactTitle = this.#extractAttribute(artifactTag, 'title') as string;
               const type = this.#extractAttribute(artifactTag, 'type') as string;
-              const artifactId = this.#extractAttribute(artifactTag, 'id') as string;
+
+              // const artifactId = this.#extractAttribute(artifactTag, 'id') as string;
+              const artifactId = `${messageId}-${state.artifactCounter++}`;
 
               if (!artifactTitle) {
                 logger.warn('Artifact title missing');
@@ -213,11 +284,15 @@ export class StreamingMessageParser {
 
               state.currentArtifact = currentArtifact;
 
-              this._options.callbacks?.onArtifactOpen?.({ messageId, ...currentArtifact });
+              this._options.callbacks?.onArtifactOpen?.({
+                messageId,
+                artifactId: currentArtifact.id,
+                ...currentArtifact,
+              });
 
               const artifactFactory = this._options.artifactElement ?? createArtifactElement;
 
-              output += artifactFactory({ messageId });
+              output += artifactFactory({ messageId, artifactId });
 
               i = openTagEnd + 1;
             } else {
@@ -238,6 +313,10 @@ export class StreamingMessageParser {
           break;
         }
       } else {
+        /*
+         * Note: Auto-file-creation from code blocks is now handled by EnhancedMessageParser
+         * to avoid duplicate processing and provide better shell command detection
+         */
         output += input[i];
         i++;
       }
@@ -266,7 +345,27 @@ export class StreamingMessageParser {
       content: '',
     };
 
-    if (actionType === 'file') {
+    if (actionType === 'supabase') {
+      const operation = this.#extractAttribute(actionTag, 'operation');
+
+      if (!operation || !['migration', 'query'].includes(operation)) {
+        logger.warn(`Invalid or missing operation for Supabase action: ${operation}`);
+        throw new Error(`Invalid Supabase operation: ${operation}`);
+      }
+
+      (actionAttributes as SupabaseAction).operation = operation as 'migration' | 'query';
+
+      if (operation === 'migration') {
+        const filePath = this.#extractAttribute(actionTag, 'filePath');
+
+        if (!filePath) {
+          logger.warn('Migration requires a filePath');
+          throw new Error('Migration requires a filePath');
+        }
+
+        (actionAttributes as SupabaseAction).filePath = filePath;
+      }
+    } else if (actionType === 'file') {
       const filePath = this.#extractAttribute(actionTag, 'filePath') as string;
 
       if (!filePath) {
@@ -300,4 +399,18 @@ const createArtifactElement: ElementFactory = (props) => {
 
 function camelToDashCase(input: string) {
   return input.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+}
+
+function createQuickActionElement(props: Record<string, string>, label: string) {
+  const elementProps = [
+    'class="__boltQuickAction__"',
+    'data-bolt-quick-action="true"',
+    ...Object.entries(props).map(([key, value]) => `data-${camelToDashCase(key)}=${JSON.stringify(value)}`),
+  ];
+
+  return `<button ${elementProps.join(' ')}>${label}</button>`;
+}
+
+function createQuickActionGroup(buttons: string[]) {
+  return `<div class=\"__boltQuickAction__\" data-bolt-quick-action=\"true\">${buttons.join('')}</div>`;
 }

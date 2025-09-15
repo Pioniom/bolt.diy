@@ -43,56 +43,139 @@ export function useGit() {
   }, []);
 
   const gitClone = useCallback(
-    async (url: string) => {
+    async (url: string, retryCount = 0) => {
       if (!webcontainer || !fs || !ready) {
-        throw 'Webcontainer not initialized';
+        throw new Error('Webcontainer not initialized. Please try again later.');
       }
 
       fileData.current = {};
-      await git.clone({
-        fs,
-        http,
-        dir: webcontainer.workdir,
-        url,
-        depth: 1,
-        singleBranch: true,
-        corsProxy: 'https://cors.isomorphic-git.org',
-        onAuth: (url) => {
-          // let domain=url.split("/")[2]
 
-          let auth = lookupSavedPassword(url);
+      let branch: string | undefined;
+      let baseUrl = url;
 
-          if (auth) {
-            return auth;
-          }
-
-          if (confirm('This repo is password protected. Ready to enter a username & password?')) {
-            auth = {
-              username: prompt('Enter username'),
-              password: prompt('Enter password'),
-            };
-            return auth;
-          } else {
-            return { cancel: true };
-          }
-        },
-        onAuthFailure: (url, _auth) => {
-          toast.error(`Error Authenticating with ${url.split('/')[2]}`);
-        },
-        onAuthSuccess: (url, auth) => {
-          saveGitAuth(url, auth);
-        },
-      });
-
-      const data: Record<string, { data: any; encoding?: string }> = {};
-
-      for (const [key, value] of Object.entries(fileData.current)) {
-        data[key] = value;
+      if (url.includes('#')) {
+        [baseUrl, branch] = url.split('#');
       }
 
-      return { workdir: webcontainer.workdir, data };
+      /*
+       * Skip Git initialization for now - let isomorphic-git handle it
+       * This avoids potential issues with our manual initialization
+       */
+
+      const headers: {
+        [x: string]: string;
+      } = {
+        'User-Agent': 'bolt.diy',
+      };
+
+      const auth = lookupSavedPassword(url);
+
+      if (auth) {
+        headers.Authorization = `Basic ${Buffer.from(`${auth.username}:${auth.password}`).toString('base64')}`;
+      }
+
+      try {
+        // Add a small delay before retrying to allow for network recovery
+        if (retryCount > 0) {
+          await new Promise((resolve) => setTimeout(resolve, 1000 * retryCount));
+          console.log(`Retrying git clone (attempt ${retryCount + 1})...`);
+        }
+
+        await git.clone({
+          fs,
+          http,
+          dir: webcontainer.workdir,
+          url: baseUrl,
+          depth: 1,
+          singleBranch: true,
+          ref: branch,
+          corsProxy: '/api/git-proxy',
+          headers,
+          onProgress: (event) => {
+            console.log('Git clone progress:', event);
+          },
+          onAuth: (baseUrl) => {
+            let auth = lookupSavedPassword(baseUrl);
+
+            if (auth) {
+              console.log('Using saved authentication for', baseUrl);
+              return auth;
+            }
+
+            console.log('Repository requires authentication:', baseUrl);
+
+            if (confirm('This repository requires authentication. Would you like to enter your GitHub credentials?')) {
+              auth = {
+                username: prompt('Enter username') || '',
+                password: prompt('Enter password or personal access token') || '',
+              };
+              return auth;
+            } else {
+              return { cancel: true };
+            }
+          },
+          onAuthFailure: (baseUrl, _auth) => {
+            console.error(`Authentication failed for ${baseUrl}`);
+            toast.error(
+              `Authentication failed for ${baseUrl.split('/')[2]}. Please check your credentials and try again.`,
+            );
+            throw new Error(
+              `Authentication failed for ${baseUrl.split('/')[2]}. Please check your credentials and try again.`,
+            );
+          },
+          onAuthSuccess: (baseUrl, auth) => {
+            console.log(`Authentication successful for ${baseUrl}`);
+            saveGitAuth(baseUrl, auth);
+          },
+        });
+
+        const data: Record<string, { data: any; encoding?: string }> = {};
+
+        for (const [key, value] of Object.entries(fileData.current)) {
+          data[key] = value;
+        }
+
+        return { workdir: webcontainer.workdir, data };
+      } catch (error) {
+        console.error('Git clone error:', error);
+
+        // Handle specific error types
+        const errorMessage = error instanceof Error ? error.message : String(error);
+
+        // Check for common error patterns
+        if (errorMessage.includes('Authentication failed')) {
+          toast.error(`Authentication failed. Please check your GitHub credentials and try again.`);
+          throw error;
+        } else if (
+          errorMessage.includes('ENOTFOUND') ||
+          errorMessage.includes('ETIMEDOUT') ||
+          errorMessage.includes('ECONNREFUSED')
+        ) {
+          toast.error(`Network error while connecting to repository. Please check your internet connection.`);
+
+          // Retry for network errors, up to 3 times
+          if (retryCount < 3) {
+            return gitClone(url, retryCount + 1);
+          }
+
+          throw new Error(
+            `Failed to connect to repository after multiple attempts. Please check your internet connection.`,
+          );
+        } else if (errorMessage.includes('404')) {
+          toast.error(`Repository not found. Please check the URL and make sure the repository exists.`);
+          throw new Error(`Repository not found. Please check the URL and make sure the repository exists.`);
+        } else if (errorMessage.includes('401')) {
+          toast.error(`Unauthorized access to repository. Please connect your GitHub account with proper permissions.`);
+          throw new Error(
+            `Unauthorized access to repository. Please connect your GitHub account with proper permissions.`,
+          );
+        } else {
+          toast.error(`Failed to clone repository: ${errorMessage}`);
+          throw error;
+        }
+      }
     },
-    [webcontainer],
+    [webcontainer, fs, ready],
   );
 
   return { ready, gitClone };
@@ -104,104 +187,179 @@ const getFs = (
 ) => ({
   promises: {
     readFile: async (path: string, options: any) => {
-      const encoding = options.encoding;
+      const encoding = options?.encoding;
       const relativePath = pathUtils.relative(webcontainer.workdir, path);
-      console.log('readFile', relativePath, encoding);
 
-      return await webcontainer.fs.readFile(relativePath, encoding);
+      try {
+        const result = await webcontainer.fs.readFile(relativePath, encoding);
+
+        return result;
+      } catch (error) {
+        throw error;
+      }
     },
-    writeFile: async (path: string, data: any, options: any) => {
-      const encoding = options.encoding;
+    writeFile: async (path: string, data: any, options: any = {}) => {
       const relativePath = pathUtils.relative(webcontainer.workdir, path);
-      console.log('writeFile', { relativePath, data, encoding });
 
       if (record.current) {
-        record.current[relativePath] = { data, encoding };
+        record.current[relativePath] = { data, encoding: options?.encoding };
       }
 
-      return await webcontainer.fs.writeFile(relativePath, data, { ...options, encoding });
+      try {
+        // Handle encoding properly based on data type
+        if (data instanceof Uint8Array) {
+          // For binary data, don't pass encoding
+          const result = await webcontainer.fs.writeFile(relativePath, data);
+          return result;
+        } else {
+          // For text data, use the encoding if provided
+          const encoding = options?.encoding || 'utf8';
+          const result = await webcontainer.fs.writeFile(relativePath, data, encoding);
+
+          return result;
+        }
+      } catch (error) {
+        throw error;
+      }
     },
     mkdir: async (path: string, options: any) => {
       const relativePath = pathUtils.relative(webcontainer.workdir, path);
-      console.log('mkdir', relativePath, options);
 
-      return await webcontainer.fs.mkdir(relativePath, { ...options, recursive: true });
+      try {
+        const result = await webcontainer.fs.mkdir(relativePath, { ...options, recursive: true });
+
+        return result;
+      } catch (error) {
+        throw error;
+      }
     },
     readdir: async (path: string, options: any) => {
       const relativePath = pathUtils.relative(webcontainer.workdir, path);
-      console.log('readdir', relativePath, options);
 
-      return await webcontainer.fs.readdir(relativePath, options);
+      try {
+        const result = await webcontainer.fs.readdir(relativePath, options);
+
+        return result;
+      } catch (error) {
+        throw error;
+      }
     },
     rm: async (path: string, options: any) => {
       const relativePath = pathUtils.relative(webcontainer.workdir, path);
-      console.log('rm', relativePath, options);
 
-      return await webcontainer.fs.rm(relativePath, { ...(options || {}) });
+      try {
+        const result = await webcontainer.fs.rm(relativePath, { ...(options || {}) });
+
+        return result;
+      } catch (error) {
+        throw error;
+      }
     },
     rmdir: async (path: string, options: any) => {
       const relativePath = pathUtils.relative(webcontainer.workdir, path);
-      console.log('rmdir', relativePath, options);
 
-      return await webcontainer.fs.rm(relativePath, { recursive: true, ...options });
+      try {
+        const result = await webcontainer.fs.rm(relativePath, { recursive: true, ...options });
+
+        return result;
+      } catch (error) {
+        throw error;
+      }
     },
-
-    // Mock implementations for missing functions
     unlink: async (path: string) => {
-      // unlink is just removing a single file
       const relativePath = pathUtils.relative(webcontainer.workdir, path);
-      return await webcontainer.fs.rm(relativePath, { recursive: false });
-    },
 
+      try {
+        return await webcontainer.fs.rm(relativePath, { recursive: false });
+      } catch (error) {
+        throw error;
+      }
+    },
     stat: async (path: string) => {
       try {
         const relativePath = pathUtils.relative(webcontainer.workdir, path);
-        const resp = await webcontainer.fs.readdir(pathUtils.dirname(relativePath), { withFileTypes: true });
-        const name = pathUtils.basename(relativePath);
-        const fileInfo = resp.find((x) => x.name == name);
+        const dirPath = pathUtils.dirname(relativePath);
+        const fileName = pathUtils.basename(relativePath);
+
+        // Special handling for .git/index file
+        if (relativePath === '.git/index') {
+          return {
+            isFile: () => true,
+            isDirectory: () => false,
+            isSymbolicLink: () => false,
+            size: 12, // Size of our empty index
+            mode: 0o100644, // Regular file
+            mtimeMs: Date.now(),
+            ctimeMs: Date.now(),
+            birthtimeMs: Date.now(),
+            atimeMs: Date.now(),
+            uid: 1000,
+            gid: 1000,
+            dev: 1,
+            ino: 1,
+            nlink: 1,
+            rdev: 0,
+            blksize: 4096,
+            blocks: 1,
+            mtime: new Date(),
+            ctime: new Date(),
+            birthtime: new Date(),
+            atime: new Date(),
+          };
+        }
+
+        const resp = await webcontainer.fs.readdir(dirPath, { withFileTypes: true });
+        const fileInfo = resp.find((x) => x.name === fileName);
 
         if (!fileInfo) {
-          throw new Error(`ENOENT: no such file or directory, stat '${path}'`);
+          const err = new Error(`ENOENT: no such file or directory, stat '${path}'`) as NodeJS.ErrnoException;
+          err.code = 'ENOENT';
+          err.errno = -2;
+          err.syscall = 'stat';
+          err.path = path;
+          throw err;
         }
 
         return {
           isFile: () => fileInfo.isFile(),
           isDirectory: () => fileInfo.isDirectory(),
           isSymbolicLink: () => false,
-          size: 1,
-          mode: 0o666, // Default permissions
+          size: fileInfo.isDirectory() ? 4096 : 1,
+          mode: fileInfo.isDirectory() ? 0o040755 : 0o100644, // Directory or regular file
           mtimeMs: Date.now(),
+          ctimeMs: Date.now(),
+          birthtimeMs: Date.now(),
+          atimeMs: Date.now(),
           uid: 1000,
           gid: 1000,
+          dev: 1,
+          ino: 1,
+          nlink: 1,
+          rdev: 0,
+          blksize: 4096,
+          blocks: 8,
+          mtime: new Date(),
+          ctime: new Date(),
+          birthtime: new Date(),
+          atime: new Date(),
         };
       } catch (error: any) {
-        console.log(error?.message);
+        if (!error.code) {
+          error.code = 'ENOENT';
+          error.errno = -2;
+          error.syscall = 'stat';
+          error.path = path;
+        }
 
-        const err = new Error(`ENOENT: no such file or directory, stat '${path}'`) as NodeJS.ErrnoException;
-        err.code = 'ENOENT';
-        err.errno = -2;
-        err.syscall = 'stat';
-        err.path = path;
-        throw err;
+        throw error;
       }
     },
-
     lstat: async (path: string) => {
-      /*
-       * For basic usage, lstat can return the same as stat
-       * since we're not handling symbolic links
-       */
       return await getFs(webcontainer, record).promises.stat(path);
     },
-
     readlink: async (path: string) => {
-      /*
-       * Since WebContainer doesn't support symlinks,
-       * we'll throw a "not a symbolic link" error
-       */
       throw new Error(`EINVAL: invalid argument, readlink '${path}'`);
     },
-
     symlink: async (target: string, path: string) => {
       /*
        * Since WebContainer doesn't support symlinks,

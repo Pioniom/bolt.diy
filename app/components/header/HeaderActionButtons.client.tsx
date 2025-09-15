@@ -1,71 +1,55 @@
+import { useState } from 'react';
 import { useStore } from '@nanostores/react';
-import useViewport from '~/lib/hooks';
-import { chatStore } from '~/lib/stores/chat';
 import { workbenchStore } from '~/lib/stores/workbench';
-import { classNames } from '~/utils/classNames';
+import { DeployButton } from '~/components/deploy/DeployButton';
 
-interface HeaderActionButtonsProps {}
+interface HeaderActionButtonsProps {
+  chatStarted: boolean;
+}
 
-export function HeaderActionButtons({}: HeaderActionButtonsProps) {
-  const showWorkbench = useStore(workbenchStore.showWorkbench);
-  const { showChat } = useStore(chatStore);
+export function HeaderActionButtons({ chatStarted: _chatStarted }: HeaderActionButtonsProps) {
+  const [activePreviewIndex] = useState(0);
+  const previews = useStore(workbenchStore.previews);
+  const activePreview = previews[activePreviewIndex];
 
-  const isSmallViewport = useViewport(1024);
-
-  const canHideChat = showWorkbench || !showChat;
+  const shouldShowButtons = activePreview;
 
   return (
-    <div className="flex">
-      <div className="flex border border-bolt-elements-borderColor rounded-md overflow-hidden">
-        <Button
-          active={showChat}
-          disabled={!canHideChat || isSmallViewport} // expand button is disabled on mobile as it's not needed
-          onClick={() => {
-            if (canHideChat) {
-              chatStore.setKey('showChat', !showChat);
-            }
-          }}
-        >
-          <div className="i-bolt:chat text-sm" />
-        </Button>
-        <div className="w-[1px] bg-bolt-elements-borderColor" />
-        <Button
-          active={showWorkbench}
-          onClick={() => {
-            if (showWorkbench && !showChat) {
-              chatStore.setKey('showChat', true);
-            }
+    <div className="flex items-center gap-1">
+      {/* Deploy Button */}
+      {shouldShowButtons && <DeployButton />}
 
-            workbenchStore.showWorkbench.set(!showWorkbench);
-          }}
-        >
-          <div className="i-ph:code-bold" />
-        </Button>
-      </div>
+      {/* Debug Tools */}
+      {shouldShowButtons && (
+        <div className="flex border border-bolt-elements-borderColor rounded-md overflow-hidden text-sm">
+          <button
+            onClick={() =>
+              window.open('https://github.com/stackblitz-labs/bolt.diy/issues/new?template=bug_report.yml', '_blank')
+            }
+            className="rounded-l-md items-center justify-center [&:is(:disabled,.disabled)]:cursor-not-allowed [&:is(:disabled,.disabled)]:opacity-60 px-3 py-1.5 text-xs bg-accent-500 text-white hover:text-bolt-elements-item-contentAccent [&:not(:disabled,.disabled)]:hover:bg-bolt-elements-button-primary-backgroundHover outline-accent-500 flex gap-1.5"
+            title="Report Bug"
+          >
+            <div className="i-ph:bug" />
+            <span>Report Bug</span>
+          </button>
+          <div className="w-px bg-bolt-elements-borderColor" />
+          <button
+            onClick={async () => {
+              try {
+                const { downloadDebugLog } = await import('~/utils/debugLogger');
+                await downloadDebugLog();
+              } catch (error) {
+                console.error('Failed to download debug log:', error);
+              }
+            }}
+            className="rounded-r-md items-center justify-center [&:is(:disabled,.disabled)]:cursor-not-allowed [&:is(:disabled,.disabled)]:opacity-60 px-3 py-1.5 text-xs bg-accent-500 text-white hover:text-bolt-elements-item-contentAccent [&:not(:disabled,.disabled)]:hover:bg-bolt-elements-button-primary-backgroundHover outline-accent-500 flex gap-1.5"
+            title="Download Debug Log"
+          >
+            <div className="i-ph:download" />
+            <span>Debug Log</span>
+          </button>
+        </div>
+      )}
     </div>
-  );
-}
-
-interface ButtonProps {
-  active?: boolean;
-  disabled?: boolean;
-  children?: any;
-  onClick?: VoidFunction;
-}
-
-function Button({ active = false, disabled = false, children, onClick }: ButtonProps) {
-  return (
-    <button
-      className={classNames('flex items-center p-1.5', {
-        'bg-bolt-elements-item-backgroundDefault hover:bg-bolt-elements-item-backgroundActive text-bolt-elements-textTertiary hover:text-bolt-elements-textPrimary':
-          !active,
-        'bg-bolt-elements-item-backgroundAccent text-bolt-elements-item-contentAccent': active && !disabled,
-        'bg-bolt-elements-item-backgroundDefault text-alpha-gray-20 dark:text-alpha-white-20 cursor-not-allowed':
-          disabled,
-      })}
-      onClick={onClick}
-    >
-      {children}
-    </button>
   );
 }
